@@ -1,0 +1,28 @@
+# How often to check GitHub for new releases.
+check_interval: 30m
+
+# Path to the JSON file used to store seen releases.
+state_file: /data/state.json
+
+defaults:
+  # Skip GitHub releases marked as pre-release.
+  exclude_prereleases: true
+
+  # Skip notifications for releases that were already seen before.
+  exclude_updates: true
+
+  # Send notifications for existing releases during the first run.
+  notify_on_first_run: false
+
+repos:
+# GitHub repository URL to watch.
+- url: https://github.com/prometheus/prometheus
+
+  # Override the global pre-release filter for this repository.
+  exclude_prereleases: true
+
+  # Override the global release update filter for this repository.
+  exclude_updates: true
+
+  # Override first-run notification behavior for this repository.
+  notify_on_first_run: false
