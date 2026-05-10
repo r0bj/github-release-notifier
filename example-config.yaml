@@ -1,6 +1,9 @@
 # How often to check GitHub for new releases.
 check_interval: 30m
 
+# Maximum number of repositories checked at the same time.
+max_concurrent_checks: 5
+
 # Path to the JSON file used to store seen releases.
 state_file: /data/state.json
 

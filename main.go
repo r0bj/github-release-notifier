@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,25 +25,27 @@ import (
 )
 
 const (
-	slackWebhookURLEnv       = "SLACK_WEBHOOK_URL"
-	githubTokenEnv           = "GITHUB_TOKEN"
-	defaultGitHubAPIBaseURL  = "https://api.github.com"
-	defaultCheckInterval     = 30 * time.Minute
-	defaultStateFile         = "/data/state.json"
-	defaultExcludePrerelease = true
-	defaultExcludeUpdates    = true
-	defaultNotifyOnFirstRun  = false
-	maxReleaseNotesRunes     = 1200
-	releaseNotesTruncation   = "\n..."
-	maxBlankReleaseNoteLines = 1
-	maxGitHubErrorBodyBytes  = 4096
+	slackWebhookURLEnv         = "SLACK_WEBHOOK_URL"
+	githubTokenEnv             = "GITHUB_TOKEN"
+	defaultGitHubAPIBaseURL    = "https://api.github.com"
+	defaultCheckInterval       = 30 * time.Minute
+	defaultMaxConcurrentChecks = 5
+	defaultStateFile           = "/data/state.json"
+	defaultExcludePrerelease   = true
+	defaultExcludeUpdates      = true
+	defaultNotifyOnFirstRun    = false
+	maxReleaseNotesRunes       = 1200
+	releaseNotesTruncation     = "\n..."
+	maxBlankReleaseNoteLines   = 1
+	maxGitHubErrorBodyBytes    = 4096
 )
 
 var githubAPIBaseURL = defaultGitHubAPIBaseURL
 
 type Config struct {
-	CheckInterval time.Duration `yaml:"check_interval"`
-	StateFile     string        `yaml:"state_file"`
+	CheckInterval       time.Duration `yaml:"check_interval"`
+	MaxConcurrentChecks int           `yaml:"max_concurrent_checks"`
+	StateFile           string        `yaml:"state_file"`
 
 	Defaults DefaultConfig `yaml:"defaults"`
 
@@ -115,6 +118,10 @@ func main() {
 		cfg.CheckInterval = defaultCheckInterval
 	}
 
+	if cfg.MaxConcurrentChecks <= 0 {
+		cfg.MaxConcurrentChecks = defaultMaxConcurrentChecks
+	}
+
 	if cfg.StateFile == "" {
 		cfg.StateFile = defaultStateFile
 	}
@@ -139,7 +146,12 @@ func main() {
 		log.Printf("removed %d stale repo(s) from state", removed)
 	}
 
-	log.Printf("github-release-notifier started, repos=%d, interval=%s", len(cfg.Repos), cfg.CheckInterval)
+	log.Printf(
+		"github-release-notifier started, repos=%d, interval=%s, max_concurrent_checks=%d",
+		len(cfg.Repos),
+		cfg.CheckInterval,
+		cfg.MaxConcurrentChecks,
+	)
 
 	runOnce(ctx, client, cfg, state, githubToken, slackWebhookURL)
 
@@ -184,16 +196,46 @@ func runOnce(
 	githubToken string,
 	slackWebhookURL string,
 ) {
+	var wg sync.WaitGroup
+	var stateMu sync.Mutex
+	maxConcurrentChecks := cfg.MaxConcurrentChecks
+	if maxConcurrentChecks <= 0 {
+		maxConcurrentChecks = defaultMaxConcurrentChecks
+	}
+	semaphore := make(chan struct{}, maxConcurrentChecks)
+
 	for _, repo := range cfg.Repos {
 		if repo.owner == "" || repo.name == "" {
 			log.Printf("skipping invalid repo config: url=%q", repo.URL)
 			continue
 		}
 
-		if err := checkRepo(ctx, client, cfg, repo, state, githubToken, slackWebhookURL); err != nil {
-			log.Printf("repo %s/%s failed: %v", repo.owner, repo.name, err)
-		}
+		wg.Add(1)
+		go func(repo RepoConfig) {
+			defer wg.Done()
+
+			select {
+			case semaphore <- struct{}{}:
+				defer func() {
+					<-semaphore
+				}()
+			case <-ctx.Done():
+				return
+			}
+
+			repoState := repoStateSnapshot(state, &stateMu, repo)
+
+			updatedRepoState, err := checkRepo(ctx, client, cfg, repo, repoState, githubToken, slackWebhookURL)
+			if err != nil {
+				log.Printf("repo %s/%s failed: %v", repo.owner, repo.name, err)
+				return
+			}
+
+			saveRepoState(state, &stateMu, repo, updatedRepoState)
+		}(repo)
 	}
+
+	wg.Wait()
 }
 
 func checkRepo(
@@ -201,24 +243,17 @@ func checkRepo(
 	client *http.Client,
 	cfg *Config,
 	repo RepoConfig,
-	state *State,
+	repoState RepoState,
 	githubToken string,
 	slackWebhookURL string,
-) error {
-	key := repoKey(repo.owner, repo.name)
-
-	if state.Repos == nil {
-		state.Repos = map[string]RepoState{}
-	}
-
-	repoState := state.Repos[key]
+) (RepoState, error) {
 	if repoState.SeenReleaseIDs == nil {
 		repoState.SeenReleaseIDs = map[int64]SeenRelease{}
 	}
 
 	releases, err := fetchGitHubReleases(ctx, client, githubToken, repo.owner, repo.name)
 	if err != nil {
-		return err
+		return repoState, err
 	}
 
 	sort.Slice(releases, func(i, j int) bool {
@@ -266,7 +301,7 @@ func checkRepo(
 		msg := formatSlackMessage(repo, release, releaseUpdated)
 
 		if err := sendSlackMessage(ctx, client, slackWebhookURL, msg); err != nil {
-			return fmt.Errorf("failed to send slack notification for %s/%s %s: %w",
+			return repoState, fmt.Errorf("failed to send slack notification for %s/%s %s: %w",
 				repo.owner,
 				repo.name,
 				release.TagName,
@@ -283,9 +318,43 @@ func checkRepo(
 	}
 
 	repoState.Initialized = true
-	state.Repos[key] = repoState
 
-	return nil
+	return repoState, nil
+}
+
+func repoStateSnapshot(state *State, stateMu *sync.Mutex, repo RepoConfig) RepoState {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+
+	if state.Repos == nil {
+		state.Repos = map[string]RepoState{}
+	}
+
+	return cloneRepoState(state.Repos[repoKey(repo.owner, repo.name)])
+}
+
+func saveRepoState(state *State, stateMu *sync.Mutex, repo RepoConfig, repoState RepoState) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+
+	if state.Repos == nil {
+		state.Repos = map[string]RepoState{}
+	}
+
+	state.Repos[repoKey(repo.owner, repo.name)] = repoState
+}
+
+func cloneRepoState(repoState RepoState) RepoState {
+	clone := RepoState{
+		Initialized:    repoState.Initialized,
+		SeenReleaseIDs: map[int64]SeenRelease{},
+	}
+
+	for releaseID, seenRelease := range repoState.SeenReleaseIDs {
+		clone.SeenReleaseIDs[releaseID] = seenRelease
+	}
+
+	return clone
 }
 
 func fetchGitHubReleases(
@@ -542,6 +611,10 @@ func loadConfig(path string) (*Config, error) {
 func applyConfigDefaults(cfg *Config) {
 	if cfg.CheckInterval == 0 {
 		cfg.CheckInterval = defaultCheckInterval
+	}
+
+	if cfg.MaxConcurrentChecks <= 0 {
+		cfg.MaxConcurrentChecks = defaultMaxConcurrentChecks
 	}
 
 	if cfg.StateFile == "" {

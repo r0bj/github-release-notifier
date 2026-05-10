@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -147,6 +148,10 @@ func TestLoadConfigAppliesRuntimeDefaults(t *testing.T) {
 
 	if cfg.StateFile != defaultStateFile {
 		t.Fatalf("expected default state file %q, got %q", defaultStateFile, cfg.StateFile)
+	}
+
+	if cfg.MaxConcurrentChecks != defaultMaxConcurrentChecks {
+		t.Fatalf("expected default max concurrent checks %d, got %d", defaultMaxConcurrentChecks, cfg.MaxConcurrentChecks)
 	}
 }
 
@@ -292,22 +297,18 @@ func TestCheckRepoNotifiesReleaseUpdateWhenUpdatesAreIncluded(t *testing.T) {
 		name:           "prometheus",
 		ExcludeUpdates: &excludeUpdates,
 	}
-	state := &State{
-		Repos: map[string]RepoState{
-			"prometheus/prometheus": {
-				Initialized: true,
-				SeenReleaseIDs: map[int64]SeenRelease{
-					123: {
-						TagName:     "v1.2.3",
-						FirstSeenAt: oldUpdatedAt,
-						UpdatedAt:   oldUpdatedAt,
-					},
-				},
+	repoState := RepoState{
+		Initialized: true,
+		SeenReleaseIDs: map[int64]SeenRelease{
+			123: {
+				TagName:     "v1.2.3",
+				FirstSeenAt: oldUpdatedAt,
+				UpdatedAt:   oldUpdatedAt,
 			},
 		},
 	}
 
-	err := checkRepo(context.Background(), client, cfg, repo, state, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
@@ -318,7 +319,7 @@ func TestCheckRepoNotifiesReleaseUpdateWhenUpdatesAreIncluded(t *testing.T) {
 
 	assertContains(t, slackMessages[0].Text, "*Updated GitHub release*")
 
-	seenRelease := state.Repos["prometheus/prometheus"].SeenReleaseIDs[123]
+	seenRelease := repoState.SeenReleaseIDs[123]
 	if !seenRelease.UpdatedAt.Equal(newUpdatedAt) {
 		t.Fatalf("expected state UpdatedAt to be refreshed, got %s", seenRelease.UpdatedAt)
 	}
@@ -362,27 +363,23 @@ func TestCheckRepoSkipsReleaseUpdateWhenUpdatesAreExcluded(t *testing.T) {
 		owner: "prometheus",
 		name:  "prometheus",
 	}
-	state := &State{
-		Repos: map[string]RepoState{
-			"prometheus/prometheus": {
-				Initialized: true,
-				SeenReleaseIDs: map[int64]SeenRelease{
-					123: {
-						TagName:     "v1.2.3",
-						FirstSeenAt: oldUpdatedAt,
-						UpdatedAt:   oldUpdatedAt,
-					},
-				},
+	repoState := RepoState{
+		Initialized: true,
+		SeenReleaseIDs: map[int64]SeenRelease{
+			123: {
+				TagName:     "v1.2.3",
+				FirstSeenAt: oldUpdatedAt,
+				UpdatedAt:   oldUpdatedAt,
 			},
 		},
 	}
 
-	err := checkRepo(context.Background(), client, cfg, repo, state, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
 
-	seenRelease := state.Repos["prometheus/prometheus"].SeenReleaseIDs[123]
+	seenRelease := repoState.SeenReleaseIDs[123]
 	if !seenRelease.UpdatedAt.Equal(newUpdatedAt) {
 		t.Fatalf("expected state UpdatedAt to be refreshed, got %s", seenRelease.UpdatedAt)
 	}
@@ -420,6 +417,63 @@ func TestFetchGitHubReleasesIncludesForbiddenDetails(t *testing.T) {
 	assertContains(t, err.Error(), "rate_limit_resource=core")
 }
 
+func TestRunOnceLimitsConcurrentRepoChecks(t *testing.T) {
+	var activeRequests int64
+	var maxActiveRequests int64
+
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			switch r.URL.Host {
+			case "github.test":
+				active := atomic.AddInt64(&activeRequests, 1)
+				for {
+					maxActive := atomic.LoadInt64(&maxActiveRequests)
+					if active <= maxActive || atomic.CompareAndSwapInt64(&maxActiveRequests, maxActive, active) {
+						break
+					}
+				}
+
+				time.Sleep(20 * time.Millisecond)
+				atomic.AddInt64(&activeRequests, -1)
+				return jsonResponse(t, []GitHubRelease{}), nil
+			case "slack.test":
+				t.Fatal("did not expect slack notification")
+				return nil, nil
+			default:
+				t.Fatalf("unexpected host: %s", r.URL.Host)
+				return nil, nil
+			}
+		}),
+	}
+	restoreGitHubAPIBaseURL := useTestGitHubAPIBaseURL()
+	defer restoreGitHubAPIBaseURL()
+
+	cfg := &Config{
+		MaxConcurrentChecks: 3,
+		Repos: []RepoConfig{
+			{owner: "owner", name: "repo-1"},
+			{owner: "owner", name: "repo-2"},
+			{owner: "owner", name: "repo-3"},
+			{owner: "owner", name: "repo-4"},
+			{owner: "owner", name: "repo-5"},
+			{owner: "owner", name: "repo-6"},
+			{owner: "owner", name: "repo-7"},
+			{owner: "owner", name: "repo-8"},
+		},
+	}
+	state := &State{Repos: map[string]RepoState{}}
+
+	runOnce(context.Background(), client, cfg, state, "", "https://slack.test/webhook")
+
+	if maxActiveRequests > int64(cfg.MaxConcurrentChecks) {
+		t.Fatalf("expected at most %d concurrent requests, got %d", cfg.MaxConcurrentChecks, maxActiveRequests)
+	}
+
+	if len(state.Repos) != len(cfg.Repos) {
+		t.Fatalf("expected %d state repos, got %d", len(cfg.Repos), len(state.Repos))
+	}
+}
+
 func TestCheckRepoSkipsPrereleasesByDefault(t *testing.T) {
 	updatedAt := time.Date(2026, 1, 4, 3, 4, 5, 0, time.UTC)
 	release := GitHubRelease{
@@ -441,14 +495,14 @@ func TestCheckRepoSkipsPrereleasesByDefault(t *testing.T) {
 		owner: "prometheus",
 		name:  "prometheus",
 	}
-	state := &State{Repos: map[string]RepoState{}}
+	repoState := RepoState{}
 
-	err := checkRepo(context.Background(), client, cfg, repo, state, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
 
-	if len(state.Repos["prometheus/prometheus"].SeenReleaseIDs) != 0 {
+	if len(repoState.SeenReleaseIDs) != 0 {
 		t.Fatal("expected prerelease to stay unseen when prereleases are excluded")
 	}
 }
@@ -479,9 +533,9 @@ func TestCheckRepoAllowsPrereleaseWhenRepoOverrideDisablesExclusion(t *testing.T
 		ExcludePrereleases: &includePrereleases,
 		NotifyOnFirstRun:   &notifyOnFirstRun,
 	}
-	state := &State{Repos: map[string]RepoState{}}
+	repoState := RepoState{}
 
-	err := checkRepo(context.Background(), client, cfg, repo, state, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
@@ -515,9 +569,9 @@ func TestCheckRepoUsesGlobalDefaults(t *testing.T) {
 		owner: "prometheus",
 		name:  "prometheus",
 	}
-	state := &State{Repos: map[string]RepoState{}}
+	repoState := RepoState{}
 
-	err := checkRepo(context.Background(), client, cfg, repo, state, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
@@ -546,14 +600,14 @@ func TestCheckRepoDoesNotNotifyOnFirstRunByDefault(t *testing.T) {
 		owner: "prometheus",
 		name:  "prometheus",
 	}
-	state := &State{Repos: map[string]RepoState{}}
+	repoState := RepoState{}
 
-	err := checkRepo(context.Background(), client, cfg, repo, state, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
 
-	if _, ok := state.Repos["prometheus/prometheus"].SeenReleaseIDs[123]; !ok {
+	if _, ok := repoState.SeenReleaseIDs[123]; !ok {
 		t.Fatal("expected release to be marked seen on first run")
 	}
 }
@@ -580,9 +634,9 @@ func TestCheckRepoNotifiesOnFirstRunWhenRepoOverrideEnablesIt(t *testing.T) {
 		name:             "prometheus",
 		NotifyOnFirstRun: &notifyOnFirstRun,
 	}
-	state := &State{Repos: map[string]RepoState{}}
+	repoState := RepoState{}
 
-	err := checkRepo(context.Background(), client, cfg, repo, state, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
