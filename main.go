@@ -510,7 +510,7 @@ func formatSlackMessage(repo RepoConfig, release GitHubRelease, isUpdate bool) s
 	}
 
 	return fmt.Sprintf(
-		":rocket: *%s GitHub release* for *%s/%s*\n*<%s|%s>* (`%s`)%s\n%s",
+		"*%s release* for *%s/%s*\n*<%s|%s>* (`%s`)%s\n%s",
 		action,
 		repo.owner,
 		repo.name,
