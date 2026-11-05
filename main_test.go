@@ -29,7 +29,7 @@ func TestFormatSlackMessageIncludesReleaseNotes(t *testing.T) {
 
 	message := formatSlackMessage(repo, release, false)
 
-	assertContains(t, message, ":rocket: *New GitHub release* for *prometheus/prometheus*")
+	assertContains(t, message, "*New release* for *prometheus/prometheus*")
 	assertContains(t, message, "*<https://github.com/prometheus/prometheus/releases/tag/v1.2.3|Release v1.2.3>* (`v1.2.3`)")
 	assertContains(t, message, "*Release notes:*")
 	assertContains(t, message, "> ## What's Changed")
@@ -68,7 +68,7 @@ func TestFormatSlackMessageMarksUpdates(t *testing.T) {
 
 	message := formatSlackMessage(repo, release, true)
 
-	assertContains(t, message, ":rocket: *Updated GitHub release* for *prometheus/prometheus*")
+	assertContains(t, message, "*Updated release* for *prometheus/prometheus*")
 }
 
 func TestFormatReleaseNotesTruncatesLongBody(t *testing.T) {
@@ -308,7 +308,7 @@ func TestCheckRepoNotifiesReleaseUpdateWhenUpdatesAreIncluded(t *testing.T) {
 		},
 	}
 
-	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", SlackConfig{WebhookURL: "https://slack.test/webhook"})
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestCheckRepoNotifiesReleaseUpdateWhenUpdatesAreIncluded(t *testing.T) {
 		t.Fatalf("expected 1 slack message, got %d", len(slackMessages))
 	}
 
-	assertContains(t, slackMessages[0].Text, "*Updated GitHub release*")
+	assertContains(t, slackMessages[0].Text, "*Updated release*")
 
 	seenRelease := repoState.SeenReleaseIDs[123]
 	if !seenRelease.UpdatedAt.Equal(newUpdatedAt) {
@@ -374,7 +374,7 @@ func TestCheckRepoSkipsReleaseUpdateWhenUpdatesAreExcluded(t *testing.T) {
 		},
 	}
 
-	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", SlackConfig{WebhookURL: "https://slack.test/webhook"})
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
@@ -463,7 +463,7 @@ func TestRunOnceLimitsConcurrentRepoChecks(t *testing.T) {
 	}
 	state := &State{Repos: map[string]RepoState{}}
 
-	runOnce(context.Background(), client, cfg, state, "", "https://slack.test/webhook")
+	runOnce(context.Background(), client, cfg, state, "", SlackConfig{WebhookURL: "https://slack.test/webhook"})
 
 	if maxActiveRequests > int64(cfg.MaxConcurrentChecks) {
 		t.Fatalf("expected at most %d concurrent requests, got %d", cfg.MaxConcurrentChecks, maxActiveRequests)
@@ -497,7 +497,7 @@ func TestCheckRepoSkipsPrereleasesByDefault(t *testing.T) {
 	}
 	repoState := RepoState{}
 
-	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", SlackConfig{WebhookURL: "https://slack.test/webhook"})
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
@@ -535,7 +535,7 @@ func TestCheckRepoAllowsPrereleaseWhenRepoOverrideDisablesExclusion(t *testing.T
 	}
 	repoState := RepoState{}
 
-	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", SlackConfig{WebhookURL: "https://slack.test/webhook"})
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
@@ -571,7 +571,7 @@ func TestCheckRepoUsesGlobalDefaults(t *testing.T) {
 	}
 	repoState := RepoState{}
 
-	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", SlackConfig{WebhookURL: "https://slack.test/webhook"})
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
@@ -602,7 +602,7 @@ func TestCheckRepoDoesNotNotifyOnFirstRunByDefault(t *testing.T) {
 	}
 	repoState := RepoState{}
 
-	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", SlackConfig{WebhookURL: "https://slack.test/webhook"})
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
@@ -636,7 +636,7 @@ func TestCheckRepoNotifiesOnFirstRunWhenRepoOverrideEnablesIt(t *testing.T) {
 	}
 	repoState := RepoState{}
 
-	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", "https://slack.test/webhook")
+	repoState, err := checkRepo(context.Background(), client, cfg, repo, repoState, "", SlackConfig{WebhookURL: "https://slack.test/webhook"})
 	if err != nil {
 		t.Fatalf("checkRepo returned error: %v", err)
 	}
@@ -786,5 +786,90 @@ func useTestGitHubAPIBaseURL() func() {
 
 	return func() {
 		githubAPIBaseURL = oldGitHubAPIBaseURL
+	}
+}
+
+func useTestSlackAPIBaseURL() func() {
+	oldSlackAPIBaseURL := slackAPIBaseURL
+	slackAPIBaseURL = "https://slackapi.test/api"
+
+	return func() {
+		slackAPIBaseURL = oldSlackAPIBaseURL
+	}
+}
+
+func TestSendSlackMessageUsesBotToken(t *testing.T) {
+	defer useTestSlackAPIBaseURL()()
+
+	var got SlackMessage
+	var authHeader string
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Host != "slackapi.test" || r.URL.Path != "/api/chat.postMessage" {
+				t.Fatalf("unexpected request: %s", r.URL)
+			}
+			authHeader = r.Header.Get("Authorization")
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Fatalf("failed to decode slack payload: %v", err)
+			}
+			return jsonResponse(t, map[string]any{"ok": true}), nil
+		}),
+	}
+
+	slackCfg := SlackConfig{
+		WebhookURL: "https://slack.test/webhook",
+		BotToken:   "xoxb-test",
+		Channel:    "#releases",
+	}
+	if err := sendSlackMessage(context.Background(), client, slackCfg, "hello"); err != nil {
+		t.Fatalf("sendSlackMessage returned error: %v", err)
+	}
+
+	if authHeader != "Bearer xoxb-test" {
+		t.Fatalf("unexpected Authorization header: %q", authHeader)
+	}
+	if got.Channel != "#releases" || got.Text != "hello" {
+		t.Fatalf("unexpected payload: %+v", got)
+	}
+}
+
+func TestSendSlackMessageReturnsSlackAPIError(t *testing.T) {
+	defer useTestSlackAPIBaseURL()()
+
+	client := &http.Client{
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return jsonResponse(t, map[string]any{"ok": false, "error": "not_in_channel"}), nil
+		}),
+	}
+
+	slackCfg := SlackConfig{BotToken: "xoxb-test", Channel: "C123"}
+	err := sendSlackMessage(context.Background(), client, slackCfg, "hello")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	assertContains(t, err.Error(), "not_in_channel")
+}
+
+func TestSlackConfigValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     SlackConfig
+		wantErr bool
+	}{
+		{name: "webhook", cfg: SlackConfig{WebhookURL: "https://slack.test/webhook"}},
+		{name: "bot token", cfg: SlackConfig{BotToken: "xoxb-test", Channel: "C123"}},
+		{name: "bot token without channel", cfg: SlackConfig{BotToken: "xoxb-test"}, wantErr: true},
+		{name: "bot token without channel even with webhook", cfg: SlackConfig{BotToken: "xoxb-test", WebhookURL: "https://slack.test/webhook"}, wantErr: true},
+		{name: "empty", cfg: SlackConfig{}, wantErr: true},
+		{name: "channel only", cfg: SlackConfig{Channel: "C123"}, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
 	}
 }

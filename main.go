@@ -26,6 +26,10 @@ import (
 
 const (
 	slackWebhookURLEnv         = "SLACK_WEBHOOK_URL"
+	slackBotTokenEnv           = "SLACK_BOT_TOKEN"
+	slackChannelEnv            = "SLACK_CHANNEL"
+	defaultSlackAPIBaseURL     = "https://slack.com/api"
+	maxSlackErrorBodyBytes     = 4096
 	githubTokenEnv             = "GITHUB_TOKEN"
 	defaultGitHubAPIBaseURL    = "https://api.github.com"
 	defaultCheckInterval       = 30 * time.Minute
@@ -40,7 +44,10 @@ const (
 	maxGitHubErrorBodyBytes    = 4096
 )
 
-var githubAPIBaseURL = defaultGitHubAPIBaseURL
+var (
+	githubAPIBaseURL = defaultGitHubAPIBaseURL
+	slackAPIBaseURL  = defaultSlackAPIBaseURL
+)
 
 type Config struct {
 	CheckInterval       time.Duration `yaml:"check_interval"`
@@ -98,7 +105,54 @@ type SeenRelease struct {
 }
 
 type SlackMessage struct {
-	Text string `json:"text"`
+	Channel string `json:"channel,omitempty"`
+	Text    string `json:"text"`
+}
+
+// SlackConfig describes how notifications are delivered to Slack: either via
+// an incoming webhook URL or via the Web API (chat.postMessage) using a bot
+// token and a channel. When a bot token is set it takes precedence.
+type SlackConfig struct {
+	WebhookURL string
+	BotToken   string
+	Channel    string
+}
+
+type slackAPIResponse struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error"`
+}
+
+func slackConfigFromEnv() (SlackConfig, error) {
+	cfg := SlackConfig{
+		WebhookURL: strings.TrimSpace(os.Getenv(slackWebhookURLEnv)),
+		BotToken:   strings.TrimSpace(os.Getenv(slackBotTokenEnv)),
+		Channel:    strings.TrimSpace(os.Getenv(slackChannelEnv)),
+	}
+
+	return cfg, cfg.validate()
+}
+
+func (c SlackConfig) validate() error {
+	if c.BotToken != "" {
+		if c.Channel == "" {
+			return fmt.Errorf("%s is required when %s is set", slackChannelEnv, slackBotTokenEnv)
+		}
+		return nil
+	}
+
+	if c.WebhookURL == "" {
+		return fmt.Errorf("either %s (with %s) or %s is required", slackBotTokenEnv, slackChannelEnv, slackWebhookURLEnv)
+	}
+
+	return nil
+}
+
+func (c SlackConfig) mode() string {
+	if c.BotToken != "" {
+		return "bot_token"
+	}
+	return "webhook"
 }
 
 func main() {
@@ -126,9 +180,12 @@ func main() {
 		cfg.StateFile = defaultStateFile
 	}
 
-	slackWebhookURL := os.Getenv(slackWebhookURLEnv)
-	if slackWebhookURL == "" {
-		log.Fatalf("%s is required", slackWebhookURLEnv)
+	slackCfg, err := slackConfigFromEnv()
+	if err != nil {
+		log.Fatalf("invalid slack configuration: %v", err)
+	}
+	if slackCfg.BotToken != "" && slackCfg.WebhookURL != "" {
+		log.Printf("both %s and %s are set, using %s", slackBotTokenEnv, slackWebhookURLEnv, slackBotTokenEnv)
 	}
 
 	githubToken := os.Getenv(githubTokenEnv)
@@ -147,13 +204,14 @@ func main() {
 	}
 
 	log.Printf(
-		"github-release-notifier started, repos=%d, interval=%s, max_concurrent_checks=%d",
+		"github-release-notifier started, repos=%d, interval=%s, max_concurrent_checks=%d, slack_mode=%s",
 		len(cfg.Repos),
 		cfg.CheckInterval,
 		cfg.MaxConcurrentChecks,
+		slackCfg.mode(),
 	)
 
-	runOnce(ctx, client, cfg, state, githubToken, slackWebhookURL)
+	runOnce(ctx, client, cfg, state, githubToken, slackCfg)
 
 	if err := saveState(cfg.StateFile, state); err != nil {
 		log.Printf("failed to save state: %v", err)
@@ -179,7 +237,7 @@ func main() {
 			case <-time.After(jitter):
 			}
 
-			runOnce(ctx, client, cfg, state, githubToken, slackWebhookURL)
+			runOnce(ctx, client, cfg, state, githubToken, slackCfg)
 
 			if err := saveState(cfg.StateFile, state); err != nil {
 				log.Printf("failed to save state: %v", err)
@@ -194,7 +252,7 @@ func runOnce(
 	cfg *Config,
 	state *State,
 	githubToken string,
-	slackWebhookURL string,
+	slackCfg SlackConfig,
 ) {
 	var wg sync.WaitGroup
 	var stateMu sync.Mutex
@@ -225,7 +283,7 @@ func runOnce(
 
 			repoState := repoStateSnapshot(state, &stateMu, repo)
 
-			updatedRepoState, err := checkRepo(ctx, client, cfg, repo, repoState, githubToken, slackWebhookURL)
+			updatedRepoState, err := checkRepo(ctx, client, cfg, repo, repoState, githubToken, slackCfg)
 			if err != nil {
 				log.Printf("repo %s/%s failed: %v", repo.owner, repo.name, err)
 				return
@@ -245,7 +303,7 @@ func checkRepo(
 	repo RepoConfig,
 	repoState RepoState,
 	githubToken string,
-	slackWebhookURL string,
+	slackCfg SlackConfig,
 ) (RepoState, error) {
 	if repoState.SeenReleaseIDs == nil {
 		repoState.SeenReleaseIDs = map[int64]SeenRelease{}
@@ -300,7 +358,7 @@ func checkRepo(
 
 		msg := formatSlackMessage(repo, release, releaseUpdated)
 
-		if err := sendSlackMessage(ctx, client, slackWebhookURL, msg); err != nil {
+		if err := sendSlackMessage(ctx, client, slackCfg, msg); err != nil {
 			return repoState, fmt.Errorf("failed to send slack notification for %s/%s %s: %w",
 				repo.owner,
 				repo.name,
@@ -468,7 +526,15 @@ func headerValue(header http.Header, name string) string {
 	return ""
 }
 
-func sendSlackMessage(ctx context.Context, client *http.Client, webhookURL string, text string) error {
+func sendSlackMessage(ctx context.Context, client *http.Client, slackCfg SlackConfig, text string) error {
+	if slackCfg.BotToken != "" {
+		return sendSlackAPIMessage(ctx, client, slackCfg.BotToken, slackCfg.Channel, text)
+	}
+
+	return sendSlackWebhookMessage(ctx, client, slackCfg.WebhookURL, text)
+}
+
+func sendSlackWebhookMessage(ctx context.Context, client *http.Client, webhookURL string, text string) error {
 	payload := SlackMessage{
 		Text: text,
 	}
@@ -493,6 +559,57 @@ func sendSlackMessage(ctx context.Context, client *http.Client, webhookURL strin
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("slack webhook returned status %s", resp.Status)
+	}
+
+	return nil
+}
+
+func sendSlackAPIMessage(ctx context.Context, client *http.Client, botToken string, channel string, text string) error {
+	payload := SlackMessage{
+		Channel: channel,
+		Text:    text,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	endpoint := strings.TrimRight(slackAPIBaseURL, "/") + "/chat.postMessage"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	req.Header.Set("Authorization", "Bearer "+botToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxSlackErrorBodyBytes))
+	if err != nil {
+		return fmt.Errorf("failed to read slack API response: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("slack API chat.postMessage returned status %s: %s", resp.Status, strings.TrimSpace(string(respBody)))
+	}
+
+	// Slack Web API reports most errors with HTTP 200 and ok=false.
+	var apiResp slackAPIResponse
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return fmt.Errorf("failed to decode slack API response: %w", err)
+	}
+
+	if !apiResp.OK {
+		if apiResp.Error == "" {
+			apiResp.Error = "unknown error"
+		}
+		return fmt.Errorf("slack API chat.postMessage failed: %s", apiResp.Error)
 	}
 
 	return nil
